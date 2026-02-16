@@ -12,7 +12,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from .tools import (
-    classify_tarot_question,
+    assemble_post_vision_reading,
 )
 
 load_dotenv()
@@ -22,15 +22,16 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 
 
-SYSTEM_PROMPT = """You are a Tarot question classification assistant.
+SYSTEM_PROMPT = """You are a Post-Vision Reading Assembler assistant.
 
 Rules:
-- ALWAYS call classify_tarot_question exactly once.
+- ALWAYS call assemble_post_vision_reading exactly once.
 - After tool returns, output ONLY the tool result (JSON). No extra text.
-- Primary category must reflect the stake/outcome, not just who is involved.
-Examples:
-- "Eski sevgilim paramı ödeyecek mi?" => primary: para_finans, secondary: [ask_iliskiler]
-- "İşe girebilecek miyim?" => primary: kariyer_is
+- User input contains JSON with:
+  - vision_input (required)
+  - router_input (required)
+  - user_preferences (optional)
+- Never invent cards. Only transform/normalize provided payload.
 """
 
 
@@ -43,7 +44,7 @@ def _reasoning_llm():
 
 
 def build_graph(extra_tools: list | None = None):
-    tools = [classify_tarot_question]
+    tools = [assemble_post_vision_reading]
     if extra_tools:
         tools.extend(extra_tools)
 

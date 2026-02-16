@@ -260,6 +260,39 @@ CARD_WARN_THRESHOLD = 0.65
 CARD_FAIL_THRESHOLD = 0.65
 CLARIFICATION_BLOCKED_FLAGS = {"self_harm", "violence"}
 
+QUESTION_TYPE_ENUM = {
+    "decision",
+    "probability",
+    "outcome",
+    "timing",
+    "advice",
+    "feelings_intentions",
+    "reconciliation",
+    "third_party",
+    "general",
+}
+
+SUBJECT_ENUM = {"self", "other", "couple", "unknown"}
+TARGET_ENUM = {
+    "partner",
+    "ex",
+    "crush",
+    "boss",
+    "company",
+    "family",
+    "friend",
+    "unknown_or_new_person",
+    "unknown",
+}
+TIME_WINDOW_HINT_ENUM = {
+    "days",
+    "weeks",
+    "weeks_to_3_months",
+    "3_to_6_months",
+    "6_to_12_months",
+    "open_ended",
+}
+
 ROMAN_NUMERALS = [
     "0",
     "I",
@@ -725,6 +758,428 @@ def _build_question_block(router_input: dict[str, Any], language: str, merged_fl
     }
 
 
+def _extract_other_label(question_text: str) -> str | None:
+    if not question_text:
+        return None
+    candidates = re.findall(r"\b(?:X|[A-ZÇĞİÖŞÜ][a-zçğıöşü]{2,})\b", question_text)
+    if not candidates:
+        return None
+
+    stop_words = {
+        "A",
+        "Ask",
+        "Aski",
+        "Ben",
+        "Beni",
+        "Benim",
+        "Bu",
+        "Bunu",
+        "Eski",
+        "Iliski",
+        "Kariyer",
+        "Ne",
+        "Onun",
+        "Tarot",
+        "Yeni",
+    }
+    for token in candidates:
+        if token in stop_words:
+            continue
+        return token
+    return None
+
+
+def _detect_question_type(question_norm: str, sub_intent_norm: str) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+
+    third_party_hit = any(
+        token in question_norm
+        for token in [
+            "ucuncu kisi",
+            "baska biri var mi",
+            "hayatinda baska biri",
+            "kiminle gorusuyor",
+            "baska biriyle",
+        ]
+    )
+    feelings_hit = any(
+        token in question_norm
+        for token in [
+            "beni seviyor mu",
+            "seviyor mu",
+            "duygulari ne",
+            "niyeti ne",
+            "ne hissediyor",
+            "beni dusunuyor mu",
+            "aklinda kim var",
+        ]
+    )
+    reconciliation_hit = any(
+        token in question_norm
+        for token in [
+            "geri doner mi",
+            "geri gelir mi",
+            "barisir miyiz",
+            "barisma",
+            "barisir miyim",
+        ]
+    )
+    timing_hit = any(token in question_norm for token in ["ne zaman", "hangi zaman", "ne vakit"])
+    decision_hit = (
+        ("miyim" in question_norm and ("mali" in question_norm or "meli" in question_norm))
+        or any(
+            token in question_norm
+            for token in [
+                "secmeli miyim",
+                "kabul etmeli miyim",
+                "baslatmali miyim",
+                "ayrilmali miyim",
+            ]
+        )
+    )
+    probability_hit = any(
+        token in question_norm for token in ["olur mu", "sansi", "ihtimali", "ihtimal", "mumkun mu"]
+    )
+    outcome_hit = any(
+        token in question_norm
+        for token in ["ne olur", "ne olacak", "sonucu ne", "sonuc ne olur", "nereye gider"]
+    )
+    advice_hit = any(token in question_norm for token in ["ne yapmaliyim", "nasil davranmaliyim", "onerin ne"])
+
+    if decision_hit and probability_hit:
+        reasons.append("ambiguous_type")
+
+    if third_party_hit:
+        return "third_party", reasons
+    if feelings_hit:
+        return "feelings_intentions", reasons
+    if reconciliation_hit:
+        return "reconciliation", reasons
+    if timing_hit:
+        return "timing", reasons
+    if decision_hit:
+        return "decision", reasons
+    if probability_hit:
+        return "probability", reasons
+    if outcome_hit:
+        return "outcome", reasons
+    if advice_hit:
+        return "advice", reasons
+
+    sub_intent_to_type = [
+        ("geri_don", "reconciliation"),
+        ("baris", "reconciliation"),
+        ("niyet", "feelings_intentions"),
+        ("sev", "feelings_intentions"),
+        ("zaman", "timing"),
+        ("timing", "timing"),
+        ("olasilik", "probability"),
+        ("karar", "decision"),
+        ("secim", "decision"),
+        ("teklif", "decision"),
+        ("advice", "advice"),
+    ]
+    for token, qtype in sub_intent_to_type:
+        if token in sub_intent_norm:
+            return qtype, reasons
+    return "general", reasons
+
+
+def _detect_subject(question_norm: str) -> str:
+    if any(token in question_norm for token in ["biz", "ikimiz", "iliskimiz", "aramiz"]):
+        return "couple"
+    if any(token in question_norm for token in [" ben ", "beni", "bana", "benim", "kendim"]):
+        return "self"
+    if any(token in question_norm for token in [" onun ", "o ", "x "]):
+        return "other"
+    return "self"
+
+
+def _detect_target(question_norm: str, domain_norm: str) -> tuple[str, bool]:
+    target_patterns = [
+        ("ex", ["eski sevgili", "ex", "eskim"]),
+        ("partner", ["sevgilim", "partnerim", "esim", "kocam", "karim"]),
+        ("crush", ["hoslandigim", "platonik", "crush"]),
+        ("boss", ["patron", "mudur", "yonetici"]),
+        ("company", ["sirket", "firma", "is yeri", "isyeri"]),
+        ("family", ["aile", "annem", "babam", "kardesim", "ailem"]),
+        ("friend", ["arkadasim", "dostum", "arkadas"]),
+        ("unknown_or_new_person", ["yeni iliski", "yeni bir iliski", "yeni biri", "tanistigim biri"]),
+    ]
+
+    for target, patterns in target_patterns:
+        if any(token in question_norm for token in patterns):
+            return target, True
+
+    if "love" in domain_norm or "ask" in domain_norm or "ilisk" in domain_norm:
+        return "unknown_or_new_person", False
+    return "unknown", False
+
+
+def _derive_time_window_hint(question_norm: str, time_horizon_norm: str) -> str:
+    if any(token in question_norm for token in ["bugun", "yarin", "hemen"]):
+        return "days"
+    if "bu hafta" in question_norm:
+        return "weeks"
+    if "bu ay" in question_norm:
+        return "weeks_to_3_months"
+    if "bu yil" in question_norm:
+        return "6_to_12_months"
+    if "yakinda" in question_norm:
+        return "weeks"
+
+    day_match = re.search(r"\b(\d+)\s*gun\b", question_norm)
+    if day_match:
+        return "days"
+    week_match = re.search(r"\b(\d+)\s*hafta\b", question_norm)
+    if week_match:
+        weeks = int(week_match.group(1))
+        return "weeks" if weeks <= 3 else "weeks_to_3_months"
+    month_match = re.search(r"\b(\d+)\s*ay\b", question_norm)
+    if month_match:
+        months = int(month_match.group(1))
+        if months <= 3:
+            return "weeks_to_3_months"
+        if months <= 6:
+            return "3_to_6_months"
+        if months <= 12:
+            return "6_to_12_months"
+        return "open_ended"
+    year_match = re.search(r"\b(\d+)\s*yil\b", question_norm)
+    if year_match:
+        years = int(year_match.group(1))
+        return "6_to_12_months" if years == 1 else "open_ended"
+
+    horizon_map = {
+        "now": "days",
+        "near_future": "weeks_to_3_months",
+        "near future": "weeks_to_3_months",
+        "mid_future": "3_to_6_months",
+        "mid future": "3_to_6_months",
+        "open_ended": "open_ended",
+        "open ended": "open_ended",
+    }
+    return horizon_map.get(time_horizon_norm, "open_ended")
+
+
+def _extract_constraints(question_norm: str) -> list[str]:
+    constraints: list[str] = []
+    if any(token in question_norm for token in ["ciddi iliski", "evlilik", "uzun vadeli"]):
+        constraints.append("serious_commitment")
+    if any(token in question_norm for token in ["gizli", "kimse bilmesin", "gizlice", "sakli"]):
+        constraints.append("secrecy")
+    if "teklif" in question_norm and ("kabul etmeli miyim" in question_norm or "miyim" in question_norm):
+        constraints.append("offer_decision")
+    return sorted(set(constraints))
+
+
+def _expected_question_types_from_sub_intent(sub_intent_norm: str) -> set[str]:
+    expected: set[str] = set()
+    if any(token in sub_intent_norm for token in ["geri_don", "baris"]):
+        expected.add("reconciliation")
+    if any(token in sub_intent_norm for token in ["niyet", "sev", "duygu"]):
+        expected.add("feelings_intentions")
+    if any(token in sub_intent_norm for token in ["timing", "zaman"]):
+        expected.add("timing")
+    if any(token in sub_intent_norm for token in ["olasilik", "sans"]):
+        expected.add("probability")
+    if any(token in sub_intent_norm for token in ["karar", "secim", "baslat", "teklif"]):
+        expected.add("decision")
+    if any(token in sub_intent_norm for token in ["advice", "oneri", "ne_yap"]):
+        expected.add("advice")
+    return expected
+
+
+def _compute_uncertainty(
+    question_text: str,
+    question_norm: str,
+    question_type: str,
+    target: str,
+    has_explicit_target: bool,
+    sub_intent_norm: str,
+    type_reasons: list[str],
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    score = 0
+    compact_text = question_norm.strip()
+
+    if not compact_text or compact_text == "?":
+        reasons.append("missing_question")
+        score += 3
+
+    too_generic = compact_text in {"ne yapmaliyim", "olur mu", "ne olur", "?"}
+    if too_generic:
+        reasons.append("too_generic")
+        score += 2
+
+    if len(compact_text.split()) <= 2:
+        reasons.append("too_short")
+        score += 1
+
+    if target in {"unknown", "unknown_or_new_person"} and not has_explicit_target:
+        reasons.append("missing_target")
+        score += 1
+
+    expected_types = _expected_question_types_from_sub_intent(sub_intent_norm)
+    if expected_types and question_type not in expected_types:
+        reasons.append("router_type_conflict")
+        score += 2
+
+    if "ambiguous_type" in type_reasons:
+        reasons.append("ambiguous_type")
+        score += 1
+
+    if len(question_text.strip()) < 8 and compact_text:
+        reasons.append("too_short")
+        score += 1
+
+    if score >= 3:
+        level = "high"
+    elif score >= 1:
+        level = "medium"
+    else:
+        level = "low"
+    return {"level": level, "reasons": sorted(set(reasons))}
+
+
+def _build_qframe_clarification(
+    uncertainty: dict[str, Any],
+    app_mode: str,
+    merged_flags: list[str],
+    router_clarify_question: Any,
+) -> dict[str, Any]:
+    blocked_by_flags = any(flag in CLARIFICATION_BLOCKED_FLAGS for flag in merged_flags)
+    no_followups_mode = app_mode in {"no_followups", "no_follow_ups"}
+    if blocked_by_flags or no_followups_mode:
+        return {"needed": False, "question": None, "choices": []}
+
+    level = str(uncertainty.get("level") or "low")
+    reasons = uncertainty.get("reasons") if isinstance(uncertainty.get("reasons"), list) else []
+    if level != "high":
+        return {"needed": False, "question": None, "choices": []}
+
+    if "too_generic" in reasons:
+        return {
+            "needed": True,
+            "question": "Bu soruda ana odak hangisi?",
+            "choices": ["iliski", "kariyer", "para/finans"],
+        }
+    if "missing_target" in reasons:
+        return {
+            "needed": True,
+            "question": "Bu soru yeni tanistiginiz biriyle mi yoksa eski bir kisiyle (ex) mi ilgili?",
+            "choices": ["yeni kisi", "eski kisi (ex)", "belirsiz"],
+        }
+    if "ambiguous_type" in reasons:
+        return {
+            "needed": True,
+            "question": "Bu soruda asil istediginiz karar mi yoksa olasilik mi?",
+            "choices": ["karar", "olasilik"],
+        }
+    if isinstance(router_clarify_question, str) and router_clarify_question.strip():
+        return {
+            "needed": True,
+            "question": router_clarify_question.strip(),
+            "choices": [],
+        }
+    return {
+        "needed": True,
+        "question": "Bu soruyu hangi kisi veya durum icin soruyorsunuz?",
+        "choices": ["kendi durumum", "belirli bir kisi", "belirsiz"],
+    }
+
+
+def _build_question_frame(
+    router_input: dict[str, Any],
+    app_mode: str,
+    merged_flags: list[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    question_text = str(router_input.get("question_text") or "").strip()
+    domain = str(router_input.get("domain") or "general").strip() or "general"
+    sub_intent = str(router_input.get("sub_intent") or "unknown").strip() or "unknown"
+    time_horizon = str(router_input.get("time_horizon") or "unknown").strip() or "unknown"
+
+    question_norm = _ascii_fold(_norm_text(question_text))
+    domain_norm = _ascii_fold(_norm_text(domain))
+    sub_intent_norm = _ascii_fold(_norm_text(sub_intent))
+    time_horizon_norm = _ascii_fold(_norm_text(time_horizon))
+
+    question_type, type_reasons = _detect_question_type(question_norm, sub_intent_norm)
+    subject = _detect_subject(f" {question_norm} ")
+    target, has_explicit_target = _detect_target(question_norm, domain_norm)
+    other_label = _extract_other_label(question_text)
+    has_explicit_target = has_explicit_target or other_label is not None
+    time_window_hint = _derive_time_window_hint(question_norm, time_horizon_norm)
+    constraints = _extract_constraints(question_norm)
+    privacy_risk = question_type in {"feelings_intentions", "third_party"}
+    safety_notes: list[str] = []
+    if privacy_risk:
+        safety_notes.append("avoid definitive mind-reading; frame as possibilities")
+    if any(flag in CLARIFICATION_BLOCKED_FLAGS for flag in merged_flags):
+        safety_notes.append("follow safety protocol for flagged sensitive content")
+
+    uncertainty = _compute_uncertainty(
+        question_text=question_text,
+        question_norm=question_norm,
+        question_type=question_type,
+        target=target,
+        has_explicit_target=has_explicit_target,
+        sub_intent_norm=sub_intent_norm,
+        type_reasons=type_reasons,
+    )
+    clarification = _build_qframe_clarification(
+        uncertainty=uncertainty,
+        app_mode=app_mode,
+        merged_flags=merged_flags,
+        router_clarify_question=router_input.get("clarify_question"),
+    )
+
+    frame = {
+        "domain": domain,
+        "sub_intent": sub_intent,
+        "question_type": question_type if question_type in QUESTION_TYPE_ENUM else "general",
+        "subject": subject if subject in SUBJECT_ENUM else "unknown",
+        "target": target if target in TARGET_ENUM else "unknown",
+        "entities": {
+            "self_label": "ben",
+            "other_label": other_label,
+        },
+        "time_horizon": time_horizon,
+        "time_window_hint": time_window_hint if time_window_hint in TIME_WINDOW_HINT_ENUM else "open_ended",
+        "constraints": constraints,
+        "privacy_risk": privacy_risk,
+        "safety_notes": safety_notes,
+        "uncertainty": uncertainty,
+        "clarification": clarification,
+    }
+
+    frame_notes: list[str] = []
+    if frame["question_type"] == "decision":
+        frame_notes.append("prefer_spread:situation_action_outcome")
+    if frame["question_type"] == "timing":
+        frame_notes.append("prefer_spread:timing_emphasis")
+
+    frame_meta = {
+        "frame_version": "v1",
+        "notes": frame_notes,
+    }
+    return frame, frame_meta
+
+
+def _qframe_metrics(question_frame: dict[str, Any]) -> dict[str, Any]:
+    uncertainty = question_frame.get("uncertainty") if isinstance(question_frame.get("uncertainty"), dict) else {}
+    level = str(uncertainty.get("level") or "low")
+    clarification = question_frame.get("clarification") if isinstance(question_frame.get("clarification"), dict) else {}
+    privacy_risk = bool(question_frame.get("privacy_risk", False))
+    return {
+        "qframe_uncertainty_low": int(level == "low"),
+        "qframe_uncertainty_medium": int(level == "medium"),
+        "qframe_uncertainty_high": int(level == "high"),
+        "qframe_clarification_triggered": int(bool(clarification.get("needed", False))),
+        "qframe_privacy_risk_rate": 1.0 if privacy_risk else 0.0,
+    }
+
+
 def _empty_quality() -> dict[str, Any]:
     return {
         "vision_quality": "fail",
@@ -764,6 +1219,22 @@ def assemble_post_vision_reading(
 
     app_mode = _ascii_fold(_norm_text(str(user_preferences.get("app_mode") or "")))
     question = _build_question_block(router_input, language, merged_flags)
+    question_frame, question_frame_meta = _build_question_frame(
+        router_input=router_input,
+        app_mode=app_mode,
+        merged_flags=merged_flags,
+    )
+    question.update(
+        {
+            "question_type": question_frame["question_type"],
+            "subject": question_frame["subject"],
+            "target": question_frame["target"],
+            "time_window_hint": question_frame["time_window_hint"],
+            "privacy_risk": question_frame["privacy_risk"],
+        }
+    )
+    qframe_metrics = _qframe_metrics(question_frame)
+    notes.extend(question_frame_meta.get("notes", []))
 
     cards_raw = vision_input.get("cards")
     quality = _empty_quality()
@@ -797,6 +1268,7 @@ def assemble_post_vision_reading(
         )
         return {
             "question": question,
+            "question_frame": question_frame,
             "spread": spread,
             "cards": [],
             "quality": quality,
@@ -805,6 +1277,7 @@ def assemble_post_vision_reading(
                 "notes": sorted(set(notes)),
                 "timestamps": {"assembled_at": now_iso},
                 "preferences": user_preferences,
+                "question_frame": question_frame_meta,
                 "metrics": {
                     "vision_quality_ok": 0,
                     "vision_quality_warn": 0,
@@ -812,6 +1285,7 @@ def assemble_post_vision_reading(
                     "clarifications_triggered": int(clarify_needed),
                     "unknown_card_rate": 0.0,
                     "avg_card_confidence": 0.0,
+                    **qframe_metrics,
                 },
             },
         }
@@ -887,6 +1361,7 @@ def assemble_post_vision_reading(
 
         return {
             "question": question,
+            "question_frame": question_frame,
             "spread": spread,
             "cards": [],
             "quality": quality,
@@ -895,6 +1370,7 @@ def assemble_post_vision_reading(
                 "notes": sorted(set(notes)),
                 "timestamps": {"assembled_at": now_iso},
                 "preferences": user_preferences,
+                "question_frame": question_frame_meta,
                 "metrics": {
                     "vision_quality_ok": 0,
                     "vision_quality_warn": 0,
@@ -902,6 +1378,7 @@ def assemble_post_vision_reading(
                     "clarifications_triggered": int(clarify_needed),
                     "unknown_card_rate": 0.0,
                     "avg_card_confidence": 0.0,
+                    **qframe_metrics,
                 },
             },
         }
@@ -1045,6 +1522,7 @@ def assemble_post_vision_reading(
 
     return {
         "question": question,
+        "question_frame": question_frame,
         "spread": spread,
         "cards": resolved_cards,
         "quality": quality,
@@ -1053,6 +1531,7 @@ def assemble_post_vision_reading(
             "notes": sorted(set(notes)),
             "timestamps": {"assembled_at": now_iso},
             "preferences": user_preferences,
+            "question_frame": question_frame_meta,
             "metrics": {
                 "vision_quality_ok": int(vision_quality == "ok"),
                 "vision_quality_warn": int(vision_quality == "warn"),
@@ -1060,6 +1539,7 @@ def assemble_post_vision_reading(
                 "clarifications_triggered": int(clarify_needed),
                 "unknown_card_rate": unknown_rate,
                 "avg_card_confidence": avg_conf,
+                **qframe_metrics,
             },
         },
     }
